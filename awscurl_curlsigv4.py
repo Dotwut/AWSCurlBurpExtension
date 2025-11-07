@@ -64,6 +64,7 @@ def _ci_get(headers, name):
 
 
 def _shell_sq(s):
+    s = s or u""
     return u"'" + s.replace(u"'", u"'\"'\"'") + u"'"
 
 
@@ -95,6 +96,36 @@ def _decode_body_utf8_first(byte_arr, content_type):
                     return JString(byte_arr, "ISO-8859-1")
                 except:
                     return u"".join(chr(b & 0xFF) for b in byte_arr)
+
+
+# ---------- Detection + ANSI-C quoting ----------
+def _has_nul_or_hard_ctrl_or_squote(body_bytes):
+    for b in body_bytes:
+        v = b & 0xFF
+        if v == 0x00:
+            return True
+        if v < 0x20 and v not in (9, 10, 13):
+            return True
+        if v == 0x27:
+            return True
+    return False
+
+
+def _ansi_c_quote(body_bytes):
+    out = []
+    for b in body_bytes:
+        v = b & 0xFF
+        if v == 0x5C:      out.append(r"\\")
+        elif v == 0x27:    out.append(r"\'")
+        elif v == 0x24:    out.append(r"\$")
+        elif v == 0x0A:    out.append(r"\n")
+        elif v == 0x0D:    out.append(r"\r")
+        elif v == 0x09:    out.append(r"\t")
+        elif 0x20 <= v <= 0x7E:
+            out.append(chr(v))
+        else:
+            out.append(r"\x%02x" % v)
+    return u"$'" + u"".join(out) + u"'"
 
 
 # ---------- Robust SigV4 extraction ----------
@@ -203,20 +234,52 @@ class AwscurlActionListener(ActionListener):
             body_bytes = req_bytes[body_off:] if len(req_bytes) > body_off else bytearray()
 
             ctype = _ci_get(headers, "content-type")
-            body = _decode_body_utf8_first(body_bytes, ctype)
 
             service, region = AwsSigV4.from_request(headers, self._msg.getHttpService().getHost())
-            payload = self._process_body(body, ctype)
+
+            from java.net import URL as JURL
+            try:
+                jurl = JURL(url)
+                if jurl.getProtocol().lower() == "https" and jurl.getPort() == 443:
+                    url = u"%s://%s%s" % (jurl.getProtocol(), jurl.getHost(), jurl.getFile())
+            except:
+                pass
 
             parts = [
-                u"awscurl --service {} --region {}".format(service, region),
-                u"-X {}".format(method)
+                u"awscurl",
+                u"--service {}".format(_shell_sq(service)),
+                u"--region {}".format(_shell_sq(region)),
+                u"--access_key \"$AWS_ACCESS_KEY_ID\"",
+                u"--secret_key \"$AWS_SECRET_ACCESS_KEY\"",
+                u"--session_token \"$AWS_SESSION_TOKEN\"",
+                u"-X {}".format(method),
             ]
+
+            def _include_header(h):
+                hl = h.lower()
+                if hl.startswith((
+                    "authorization:",
+                    "host:",
+                    "x-amz-date:",
+                    "x-amz-security-token:",
+                    "x-amz-content-sha256:",
+                    "content-length:",
+                    "accept-encoding:",
+                )):
+                    return False
+                return True
+
             for h in headers[1:]:
-                if not h.lower().startswith("authorization:"):
+                if _include_header(h):
                     parts.append(u"-H {}".format(_shell_sq(h)))
-            if payload:
-                parts.append(u"-d {}".format(_shell_sq(payload)))
+
+            if body_bytes:
+                if _has_nul_or_hard_ctrl_or_squote(body_bytes):
+                    parts.append(u"-d {}".format(_ansi_c_quote(body_bytes)))
+                else:
+                    body_text = _decode_body_utf8_first(body_bytes, ctype)
+                    parts.append(u"-d {}".format(_shell_sq(body_text)))
+
             parts.append(_shell_sq(url))
             cmd = u" \\\n".join(parts)
 
@@ -233,21 +296,6 @@ class AwscurlActionListener(ActionListener):
             self._io.err(u"Clipboard error: {}".format(e))
             parent = getBurpFrame()
             JOptionPane.showMessageDialog(parent, JString(cmd), dialog_title, JOptionPane.INFORMATION_MESSAGE)
-
-    def _process_body(self, body, ctype):
-        b = (body or u"").strip()
-        if not b:
-            return u""
-        try:
-            if "application/json" in (ctype or ""):
-                obj = json.loads(b)
-                return json.dumps(obj, indent=4, ensure_ascii=False)
-            if "xml" in (ctype or ""):
-                root = ET.fromstring(b)
-                return ET.tostring(root, encoding="unicode", method="xml")
-            return b
-        except:
-            return b
 
 
 class CurlActionListener(ActionListener):
@@ -272,17 +320,29 @@ class CurlActionListener(ActionListener):
                 u'    -H "x-amz-security-token: $AWS_SESSION_TOKEN"',
                 u'    --aws-sigv4 "aws:amz:{}:{}"'.format(region, service)
             ]
+
             for h in headers[1:]:
                 low = h.lower()
-                if low.startswith(("host:", "authorization:", "x-amz-date:", "x-amz-security-token:")):
+                if low.startswith((
+                    "host:",
+                    "authorization:",
+                    "x-amz-date:",
+                    "x-amz-security-token:",
+                    "x-amz-content-sha256:",
+                    "content-length:",
+                    "accept-encoding:",
+                )):
                     continue
                 lines.append(u"    -H {}".format(_shell_sq(h)))
 
             body_offset = info.getBodyOffset()
-            if len(req) > body_offset:
-                ctype = _ci_get(headers, "content-type")
-                body = _decode_body_utf8_first(req[body_offset:], ctype)
-                if body:
+            body_bytes = req[body_offset:] if len(req) > body_offset else bytearray()
+            if body_bytes:
+                if _has_nul_or_hard_ctrl_or_squote(body_bytes):
+                    lines.append(u"    --data-binary {}".format(_ansi_c_quote(body_bytes)))
+                else:
+                    ctype = _ci_get(headers, "content-type")
+                    body = _decode_body_utf8_first(body_bytes, ctype)
                     lines.append(u"    --data-binary {}".format(_shell_sq(body)))
 
             cmd = u"\n".join(l + u" \\" for l in lines[:-1]) + u"\n" + lines[-1]
